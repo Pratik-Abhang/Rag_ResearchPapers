@@ -11,6 +11,7 @@ from llama_index.core import (
     Settings,
     VectorStoreIndex,
     SimpleDirectoryReader,
+    SummaryIndex,
 )
 from llama_index.llms.ollama import Ollama
 from llama_index.embeddings.ollama import OllamaEmbedding
@@ -128,6 +129,33 @@ def format_sources(nodes: List[NodeWithScore]) -> List[str]:
     return items
 
 
+def detect_intent(query: str) -> str:
+    q = (query or "").strip().lower()
+    if not q:
+        return "summarize"
+    keywords = ["summarize", "summary", "overview", "tl;dr", "key points", "brief", "in short"]
+    if any(k in q for k in keywords):
+        return "summarize"
+    return "retrieve"
+
+
+def run_summarization(selected_paths: List[str], question: str) -> str:
+    # If no paths selected, load all PDFs from manifest
+    if not selected_paths:
+        manifest = load_manifest()
+        selected_paths = [v.get("path") for v in manifest.get("files", {}).values() if v.get("path")]
+    docs = []
+    if selected_paths:
+        docs = SimpleDirectoryReader(input_files=selected_paths).load_data()
+    else:
+        # Fallback to whole directory
+        docs = SimpleDirectoryReader(DATA_DIR).load_data()
+    idx = SummaryIndex.from_documents(docs, show_progress=True)
+    prompt = question.strip() or "Provide a clear, structured summary with key points, methods, and conclusions."
+    resp = idx.as_query_engine(response_mode="tree_summarize").query(prompt)
+    return str(resp)
+
+
 def main() -> None:
     st.set_page_config(page_title="RAG (LlamaIndex + Ollama + Chroma)", page_icon="📚", layout="wide")
     st.title("📚 RAG over PDFs (LlamaIndex + Ollama + Chroma)")
@@ -141,12 +169,21 @@ def main() -> None:
         # Indexed PDFs list (from manifest)
         st.markdown("**Indexed PDFs**")
         manifest = load_manifest()
-        names = [v.get("name", "?") for v in manifest.get("files", {}).values()]
+        file_items = list(manifest.get("files", {}).items())
+        names = [v.get("name", v.get("path", "?")) for _, v in file_items]
         if names:
             for n in sorted(names):
                 st.caption(n)
         else:
             st.caption("No PDFs indexed yet.")
+
+        # Selection for summarization
+        st.markdown("**Summarize specific PDFs (optional)**")
+        options = {v.get("name", v.get("path", "?")): v.get("path") for _, v in file_items}
+        selected_names = st.multiselect("Choose PDFs to summarize", options=list(options.keys()), default=list(options.keys()))
+        selected_paths = [options[n] for n in selected_names if n in options]
+
+        mode = st.radio("Mode", options=["Auto", "Retrieval QA", "Summarize"], horizontal=False)
 
         rebuild = st.button("Rebuild index from PDFs")
 
@@ -227,29 +264,39 @@ def main() -> None:
                         st.error(f"Failed to index uploaded PDFs: {e}")
 
     # Query UI
-    st.subheader("Ask a question about your PDFs")
-    question = st.text_input("Your question", value="Summarize the main ideas across these PDFs.")
-    ask = st.button("Ask")
+    st.subheader("Ask a question or request a summary")
+    question = st.text_input("Your prompt", value="Summarize the main ideas across these PDFs.")
+    ask = st.button("Run")
 
-    if ask and question.strip():
+    if ask:
         with st.spinner("Thinking..."):
             try:
-                engine = index.as_query_engine(similarity_top_k=top_k)
-                response = engine.query(question)
+                chosen_mode = mode
+                if chosen_mode == "Auto":
+                    chosen_mode = "Summarize" if detect_intent(question) == "summarize" else "Retrieval QA"
+
+                if chosen_mode == "Summarize":
+                    answer = run_summarization(selected_paths, question)
+                    st.markdown("### Summary")
+                    st.write(answer)
+                    if selected_paths:
+                        st.markdown("### Summarized Sources")
+                        for p in selected_paths:
+                            st.write(os.path.basename(p))
+                else:
+                    engine = index.as_query_engine(similarity_top_k=top_k)
+                    response = engine.query(question)
+                    st.markdown("### Answer")
+                    st.write(str(response))
+                    if hasattr(response, "source_nodes") and response.source_nodes:
+                        st.markdown("### Sources")
+                        for line in format_sources(response.source_nodes):
+                            st.write(line)
+                    else:
+                        st.caption("No sources returned.")
             except Exception as e:
-                st.error(f"Query failed: {e}")
+                st.error(f"Operation failed: {e}")
                 return
-
-        st.markdown("### Answer")
-        st.write(str(response))
-
-        # Sources
-        if hasattr(response, "source_nodes") and response.source_nodes:
-            st.markdown("### Sources")
-            for line in format_sources(response.source_nodes):
-                st.write(line)
-        else:
-            st.caption("No sources returned.")
 
     st.divider()
     st.caption(
